@@ -13,6 +13,8 @@ path = "src/main.rs"
 
 [profile.release]
 lto = true
+split-debuginfo = "packed"
+strip = "none"
 
 [dependencies]
 faster-hex = "0.8.1"
