@@ -105,7 +105,7 @@ struct Side
 
 struct Object
 {
-	by: std::cell::Cell<i64>, // This is mutable because we need to blacklist on mismatch by making it negative
+	by: std::cell::Cell<Option<i64>>, // This is mutable because we need to blacklist on mismatch by making it negative
 	sides: [Side;2],
 }
 
@@ -528,7 +528,7 @@ impl Side
 
 impl Object
 {
-	fn new(by: i64) -> Self
+	fn new(by: Option<i64>) -> Self
 	{
 		Self{by: std::cell::Cell::new(by),sides: [Side::new(),Side::new()]}
 	}
@@ -677,7 +677,7 @@ impl RKD
 		FSNode::new(path,hash)
 	}
 
-	fn insert_hash_entry<'a>(hashes: &'a mut MapHashes,hash: &Hash,by: i64) -> &'a mut Object
+	fn insert_hash_entry<'a>(hashes: &'a mut MapHashes,hash: &Hash,by: Option<i64>) -> &'a mut Object
 	{
 		if !hashes.contains_key(&hash)
 		{
@@ -698,7 +698,7 @@ impl RKD
 		{
 			if let Some(obj) = self.hashes.get(&hash)
 			{
-				if obj.by.get() != parsed.by
+				if obj.by.get().is_some()  &&  obj.by.get().unwrap() != parsed.by
 				{
 					use inline_colorization::*;
 					const cby: &str = color_bright_yellow;
@@ -713,7 +713,7 @@ impl RKD
 					*ambiguousFileCount += 1;
 
 					// Size mismatch - blacklist this hash
-					obj.by.set(-1);
+					obj.by.set(Some(-1));
 					return true;
 				}
 			}
@@ -767,7 +767,7 @@ impl RKD
 			// An item with a pseudohash can't be entered into our hash-keyed map, which disables move/rename matching
 			if let Some(hash) = parsed.hash
 			{
-				let entry = Self::insert_hash_entry(&mut self.hashes,&hash,parsed.by);
+				let entry = Self::insert_hash_entry(&mut self.hashes,&hash,Some(parsed.by));
 				entry.sides[side].paths.push(node);
 			}
 
