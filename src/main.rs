@@ -882,14 +882,16 @@ impl LogLine
 		let (rest,fields) = all_consuming(
 			tuple(
 				(
-					preceded(space0,i64),
-					preceded(tag("  "),hexhash),
-					preceded(tag("  "),preceded(opt(tag("./")),not_line_ending)),
+					preceded(space0,terminated(i64,tag("  "))),
+					separated_pair(
+						hexhash,
+						tag("  "),
+						preceded(opt(tag("./")),not_line_ending)),
 				)
 			)
 		)(input)?;
 
-		let hash = fields.1;
+		let hash = fields.1.0;
 
 		if hash.is_none()
 		{
@@ -900,7 +902,7 @@ impl LogLine
 			eprintln!(
 				"{cby}[WARNING] Missing hash [{}]: {}{cr}",
 				if side>0 {">"} else {"<"},
-				fields.2,
+				fields.1.1,
 			);
 
 			*ambiguousFileCount += 1;
@@ -910,7 +912,7 @@ impl LogLine
 		{
 			by: fields.0,
 			hash,
-			path: unsafe_dup_str(fields.2),
+			path: unsafe_dup_str(fields.1.1),
 		})))
 	}
 }
