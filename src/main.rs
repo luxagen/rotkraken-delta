@@ -744,7 +744,9 @@ impl RKD
 
 		'line_parser: for line in log 
 		{
-			let parsed = LogLine::parse(&line,ambiguousFileCount,side).unwrap().1;
+			let parsed = LogLine::parse1(&line,ambiguousFileCount,side).unwrap().1;
+
+			// TODO if error on parsed1 && log file, try parse2: error if both succeeded or both failed
 
 			if parsed.is_none() {continue;}
 
@@ -872,7 +874,7 @@ fn hexhash(input: &str) -> nom::IResult<&str,Option<Hash>>
 
 impl LogLine
 {
-	fn parse<'a>(input: &'a str,ambiguousFileCount: &mut usize,side: usize) -> nom::IResult<&'a str,Option<Self>>
+	fn parse1<'a>(input: &'a str,ambiguousFileCount: &mut usize,side: usize) -> nom::IResult<&'a str,Option<Self>>
 	{
 		use nom::{
 			sequence::*,
