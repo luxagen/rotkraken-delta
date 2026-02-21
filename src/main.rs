@@ -687,7 +687,12 @@ impl RKD
 		}
 
 		let result = hashes.get_mut(hash).unwrap(); // TODO elide lookup when inserting
-		debug_assert_eq!(by,result.by.get()); // This should never happen since we check for size mismatches earlier
+
+		if let(Some(byNew),Some(byOld)) = (by,result.by.get())
+		{
+			debug_assert_eq!(byNew,byOld); // This should never happen since we check for size mismatches earlier
+		}
+
 		result
 	}
 
@@ -698,23 +703,26 @@ impl RKD
 		{
 			if let Some(obj) = self.hashes.get(&hash)
 			{
-				if obj.by.get().is_some()  &&  obj.by.get().unwrap() != parsed.by
+				if let (Some(byParsed),Some(byObj)) = (parsed.by,obj.by.get())
 				{
-					use inline_colorization::*;
-					const cby: &str = color_bright_yellow;
-					const cr: &str = color_reset;
+					if byObj!=byParsed
+					{
+						use inline_colorization::*;
+						const cby: &str = color_bright_yellow;
+						const cr: &str = color_reset;
 
-					eprintln!(
-						"{cby}[WARNING] File-size mismatch [{}]: {}{cr}",
-						if self.sides.len() > 0 {">"} else {"<"},
-						parsed.path,
-					);
+						eprintln!(
+							"{cby}[WARNING] File-size mismatch [{}]: {}{cr}",
+							if self.sides.len() > 0 {">"} else {"<"},
+							parsed.path,
+						);
 
-					*ambiguousFileCount += 1;
+						*ambiguousFileCount += 1;
 
-					// Size mismatch - blacklist this hash
-					obj.by.set(Some(-1));
-					return true;
+						// Size mismatch - blacklist this hash
+						obj.by.set(Some(-1));
+						return true;
+					}
 				}
 			}
 		}
@@ -767,7 +775,7 @@ impl RKD
 			// An item with a pseudohash can't be entered into our hash-keyed map, which disables move/rename matching
 			if let Some(hash) = parsed.hash
 			{
-				let entry = Self::insert_hash_entry(&mut self.hashes,&hash,Some(parsed.by));
+				let entry = Self::insert_hash_entry(&mut self.hashes,&hash,parsed.by);
 				entry.sides[side].paths.push(node);
 			}
 
@@ -780,7 +788,7 @@ impl RKD
 
 struct LogLine
 {
-	by: i64,
+	by: Option<i64>, // TODO negative sentinel?
 	hash: Option<Hash>,
 	path: &'static str,
 }
@@ -921,7 +929,7 @@ impl LogLine
 
 		Ok((rest, Some(LogLine
 		{
-			by: fields.0,
+			by: Some(fields.0),
 			hash,
 			path: unsafe_dup_str(fields.1.1),
 		})))
