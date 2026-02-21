@@ -871,6 +871,7 @@ impl LogLine
 			character::complete::*,
 			bytes::complete::tag,
 			combinator::{opt,all_consuming},
+			branch::alt,
 		};
 
 		// Skip lines that start with a hash (#) character or are empty
@@ -885,7 +886,17 @@ impl LogLine
 					preceded(space0,terminated(i64,tag("  "))),
 					separated_pair(
 						hexhash,
-						tag("  "),
+						tuple(
+							(
+								char(' '),
+								alt(
+									(
+										char(' '),
+										char('*')
+									),
+								),
+							),
+						),
 						preceded(opt(tag("./")),not_line_ending)),
 				)
 			)
