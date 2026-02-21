@@ -744,9 +744,13 @@ impl RKD
 
 		'line_parser: for line in log 
 		{
-			let parsed = LogLine::parse1(&line,ambiguousFileCount,side).unwrap().1;
+			let parsed = match (LogLine::parse1(&line,ambiguousFileCount,side),LogLine::parse2(&line,ambiguousFileCount,side))
+			{
+				(Err(_),Err(_)) => {panic!("Unparseable line!")}, // Bad: unparseable
+				( Ok(_), Ok(_)) => {panic!("Ambiguous line!")}, // Ambiguous: parseable both ways
 
-			// TODO if error on parsed1 && log file, try parse2: error if both succeeded or both failed
+				(Err(_),Ok(r)) | (Ok(r),Err(_)) => {r.1}, // Good: only one matched
+			};
 
 			if parsed.is_none() {continue;}
 
@@ -934,6 +938,64 @@ impl LogLine
 			by: Some(fields.0),
 			hash,
 			path: unsafe_dup_str(fields.1.1),
+		})))
+	}
+
+	fn parse2<'a>(input: &'a str,ambiguousFileCount: &mut usize,side: usize) -> nom::IResult<&'a str,Option<Self>>
+	{
+		use nom::{
+			sequence::*,
+			character::complete::*,
+			bytes::complete::tag,
+			combinator::{opt,all_consuming},
+			branch::alt,
+		};
+
+		// Skip lines that start with a hash (#) character or are empty
+		if input.is_empty() || input.starts_with('#')
+		{
+			return Ok((input,None));
+		}
+
+		let (rest,fields) = all_consuming(
+			separated_pair(
+				hexhash,
+				tuple(
+					(
+						char(' '),
+						alt(
+							(
+								char(' '),
+								char('*')
+							),
+						),
+					),
+				),
+				preceded(opt(tag("./")),not_line_ending)),
+		)(input)?;
+
+		let hash = fields.0;
+
+		if hash.is_none()
+		{
+			use inline_colorization::*;
+			const cby: &str = color_bright_yellow;
+			const cr: &str = color_reset;
+	
+			eprintln!(
+				"{cby}[WARNING] Missing hash [{}]: {}{cr}",
+				if side>0 {">"} else {"<"},
+				fields.1,
+			);
+
+			*ambiguousFileCount += 1;
+		}
+
+		Ok((rest, Some(LogLine
+		{
+			by: None,
+			hash,
+			path: unsafe_dup_str(fields.1),
 		})))
 	}
 }
