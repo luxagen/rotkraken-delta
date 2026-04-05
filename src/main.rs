@@ -746,9 +746,37 @@ impl RKD
 		{
 			let parsed = match (LogLine::parse1(&line,ambiguousFileCount,side),LogLine::parse2(&line,ambiguousFileCount,side))
 			{
-				(Err(_),Err(_)) => {panic!("Unparseable line!")}, // Bad: unparseable
-				( Ok(_), Ok(_)) => {panic!("Ambiguous line!")}, // Ambiguous: parseable both ways
+				(Err(_),Err(_)) =>
+				{
+					use inline_colorization::*;
+					const cbr: &str = color_bright_red;
+					const cr: &str = color_reset;
+			
+					// Impossible to parse
+					eprintln!(
+						"{cbr}[ERROR] Unparseable line [{}]: {}{cr}",
+						if side>0 {">"} else {"<"},
+						&line,
+					);
 
+					std::process::exit(4);
+				},
+				(Ok((_,None)),Ok((_,None))) => None,
+				(Ok(_), Ok(_)) =>
+				{
+					use inline_colorization::*;
+					const cbr: &str = color_bright_red;
+					const cr: &str = color_reset;
+
+					// Parseable with both line formats
+					eprintln!(
+						"{cbr}[ERROR] Format-ambiguous line [{}]: {}{cr}",
+						if side>0 {">"} else {"<"},
+						&line,
+					);
+
+					std::process::exit(5);
+				},
 				(Err(_),Ok(r)) | (Ok(r),Err(_)) => {r.1}, // Good: only one matched
 			};
 
