@@ -9,7 +9,11 @@ use ahash::AHashMap;
 mod scopetimer;
 use scopetimer::ScopeTimer;
 
+const EMPTY_HASH: Hash = Hash(0xd41d8cd98f00b204e9800998ecf8427e);
+
 static DISABLE_OUTPUT: bool = false;
+
+////////////////////////////////////////////////////////////////////////////////
 
 #[derive(clap::Parser,Default,Debug)]
 #[clap(author,version,about,long_about=None)]
@@ -28,10 +32,72 @@ struct Args
 	treeR: String,
 }
 
+#[macro_use]
+extern crate lazy_static;
+
+lazy_static!
+{
+	static ref args: Args = <Args as clap::Parser>::parse();
+}
+
+#[derive(Clone)]
+enum PathLocation
+{
+	Stdin,
+	Local(String),
+	Remote {user: String,host: String,path: String}
+}
+
+////////////////////////////////////////////////////////////////////////////////
+
 #[derive(Eq,Hash,PartialEq,Clone,Copy)]
 struct Hash(u128);
 
-const EMPTY_HASH: Hash = Hash(0xd41d8cd98f00b204e9800998ecf8427e);
+// This represents a single file
+#[derive(Clone)]
+struct FSTreeFile
+{
+	hash: Option<Hash>,
+	path: &'static str,
+	done: std::cell::Cell<bool>,
+}
+
+struct FSTreeHash
+{
+	paths: Vec<&'static FSTreeFile>,
+}
+
+struct Object
+{
+	by: std::cell::Cell<Option<i64>>, // This is mutable because we need to blacklist on mismatch by making it negative
+	treeInstances: [FSTreeHash;2],
+}
+
+type MapFileFromPath = AHashMap<&'static str,&'static FSTreeFile>;
+type MapObjectFromHash = AHashMap<Hash,Object>;
+
+struct RKD
+{
+	trees: Vec<MapFileFromPath>,
+	hashes: MapObjectFromHash,
+}
+
+enum FSOp<'a>
+{
+	Delete,
+	Create,
+	CopyMove {src: &'a FSTreeFile},
+	Modify   {lhs: &'a FSTreeFile},
+}
+
+struct LogLine
+{
+	by: Option<i64>, // TODO negative sentinel?
+	hash: Option<Hash>,
+	path: &'static str,
+}
+
+////////////////////////////////////////////////////////////////////////////////
 
 impl Hash
 {
@@ -60,41 +126,584 @@ impl std::fmt::Debug for Hash
 	}
 }
 
-#[derive(Clone)]
-struct FSNode
+impl FSTreeHash
 {
-	hash: Option<Hash>,
-	path: &'static str,
-	done: std::cell::Cell<bool>,
+	fn new() -> Self
+	{
+		Self{paths: Vec::new()}
+	}
 }
 
-struct Side
+impl Object
 {
-	paths: Vec<&'static FSNode>,
+	fn new(by: Option<i64>) -> Self
+	{
+		Self{by: std::cell::Cell::new(by),treeInstances: [FSTreeHash::new(),FSTreeHash::new()]}
+	}
 }
 
-struct Object
+enum BestPrefixMatch
 {
-	by: std::cell::Cell<Option<i64>>, // This is mutable because we need to blacklist on mismatch by making it negative
-	sides: [Side;2],
+	First,
+	Second,
+	Neither, // Tie
+	// TODO distinguish tie from "no match" and implement a suffix-match threshold for the latter
 }
 
-type MapPaths = AHashMap<&'static str,&'static FSNode>;
-type MapHashes = AHashMap<Hash,Object>;
-
-struct RKD
+impl FSTreeFile
 {
-	sides: Vec<MapPaths>,
-	hashes: MapHashes,
+	fn new(path: &'static str,hash: Option<Hash>) -> Self
+	{
+		FSTreeFile
+		{
+			path,
+			hash,
+			done: std::cell::Cell::new(false),
+		}
+	}
+
+	fn try_recycle(path: &'static str,hash: Hash,otherSide: &mut MapFileFromPath) -> Option<Self>
+	{
+		if let Some(o) = otherSide.get(path)
+		{
+			if o.hash == Some(hash)
+			{
+				// Hashable and identical to an item on the other side: recycle and set done
+				o.set_done();
+				return Some((*o).clone());
+			}
+		}
+
+		None
+	}
+
+	fn clone_or_new(path: &'static str,hash: Hash,otherSide: &mut MapFileFromPath) -> Self
+	{
+		if let Some(rr) = Self::try_recycle(path,hash,otherSide) {return rr;}
+
+		Self::new(path,Some(hash))
+	}
+
+	fn is_done(&self) -> bool
+	{
+		self.done.get()
+	}
+
+	fn set_done(&self)
+	{
+		debug_assert!(!self.is_done());
+		self.done.set(true);
+	}
+
+	fn report(&self,disable: bool,op: &FSOp)
+	{
+		if self.is_done() {return};
+
+		let mut lock = std::io::stdout().lock();
+
+		use std::borrow::Cow;
+		use shell_escape::escape;
+		use colored::*;
+		use io::Write;
+		use inline_colorization::*;
+
+		const cbw: &str = color_bright_white;
+		const cr: &str = color_reset;
+
+		match op
+		{
+			FSOp::Delete | FSOp::Create  =>
+			{
+				if !disable
+				{
+					let verb  =  if let FSOp::Delete = op {"RM".red()} else {"CR".green()};
+
+					let path = escape(Cow::Borrowed(self.path));
+
+					writeln!(
+						lock,
+						"{verb} {}",
+						if self.hash.is_none() {path.bright_blue()} else {path.white()},
+					).unwrap();
+				}
+			},
+			FSOp::CopyMove{src} =>
+			{
+				assert_ne!(src.path,self.path);
+
+				// If paths match, neither must be done and it's a MV
+				let copy = if src.is_done() {true} else {src.set_done(); false};
+
+				let verb  =  if copy {"CP".cyan()} else {"MV".magenta()};
+
+				if !disable
+				{
+					if args.no_prefix
+					{
+						writeln!(
+							lock,
+							"{verb} {} {}",
+							src.path,
+							self.path
+						).unwrap();
+					}
+					else
+					{
+						let len=prefix_match_len(src.path.chars(),self.path.chars()); // Find common path prefix
+
+						// Get rid of any common terminal-name prefix match to get a valid ancestor path
+						let pos = match self.path[0..len].rfind('/')
+						{
+							Some(x) => 1+x,
+							None => 0,
+						};
+
+						let prefix = &self.path[0..pos];
+
+						// Print common ancestor and then each path relative to that
+						writeln!(
+							lock,
+							"{verb} {cbw}{}{cr}{}{} {}",
+							prefix,
+							if prefix.is_empty() {""} else {" "},
+							&escape(Cow::Borrowed(src.path))[pos..],
+							&escape(Cow::Borrowed(self.path))[pos..]).unwrap();
+					}
+				}
+			},
+			FSOp::Modify{lhs} =>
+			{
+				if !disable
+				{
+					use inline_colorization::*;
+					const cr: &str = color_reset;
+					const cmd: &str = color_yellow;
+
+					writeln!(
+						lock,
+						"{cmd}MD{cr} {}",
+						escape(Cow::Borrowed(self.path))).unwrap();
+				}
+
+				lhs.set_done();
+			},
+		};
+
+		self.set_done();
+	}
 }
 
-#[derive(Clone)]
-enum PathLocation
+impl LogLine
 {
-	Stdin,
-	Local(String),
-	Remote {user: String,host: String,path: String}
+	fn parse1<'a>(input: &'a str,ambiguousFileCount: &mut usize,side: usize) -> nom::IResult<&'a str,Option<Self>>
+	{
+		use nom::{
+			sequence::*,
+			character::complete::*,
+			bytes::complete::tag,
+			combinator::{opt,all_consuming},
+			branch::alt,
+		};
+
+		// Skip lines that start with a hash (#) character or are empty
+		if input.is_empty() || input.starts_with('#')
+		{
+			return Ok((input,None));
+		}
+
+		let (rest,fields) = all_consuming(
+			tuple(
+				(
+					preceded(space0,terminated(i64,tag("  "))),
+					separated_pair(
+						hexhash,
+						tuple(
+							(
+								char(' '),
+								alt(
+									(
+										char(' '),
+										char('*')
+									),
+								),
+							),
+						),
+						preceded(opt(tag("./")),not_line_ending)),
+				)
+			)
+		)(input)?;
+
+		let hash = fields.1.0;
+
+		if hash.is_none()
+		{
+			use inline_colorization::*;
+			const cby: &str = color_bright_yellow;
+			const cr: &str = color_reset;
+	
+			eprintln!(
+				"{cby}[WARNING] Missing hash [{}]: {}{cr}",
+				if side>0 {">"} else {"<"},
+				fields.1.1,
+			);
+
+			*ambiguousFileCount += 1;
+		}
+
+		Ok((rest, Some(LogLine
+		{
+			by: Some(fields.0),
+			hash,
+			path: unsafe_dup_str(fields.1.1),
+		})))
+	}
+
+	fn parse2<'a>(input: &'a str,ambiguousFileCount: &mut usize,side: usize) -> nom::IResult<&'a str,Option<Self>>
+	{
+		use nom::{
+			sequence::*,
+			character::complete::*,
+			bytes::complete::tag,
+			combinator::{opt,all_consuming},
+			branch::alt,
+		};
+
+		// Skip lines that start with a hash (#) character or are empty
+		if input.is_empty() || input.starts_with('#')
+		{
+			return Ok((input,None));
+		}
+
+		let (rest,fields) = all_consuming(
+			separated_pair(
+				hexhash,
+				tuple(
+					(
+						char(' '),
+						alt(
+							(
+								char(' '),
+								char('*')
+							),
+						),
+					),
+				),
+				preceded(opt(tag("./")),not_line_ending)),
+		)(input)?;
+
+		let hash = fields.0;
+
+		if hash.is_none()
+		{
+			use inline_colorization::*;
+			const cby: &str = color_bright_yellow;
+			const cr: &str = color_reset;
+	
+			eprintln!(
+				"{cby}[WARNING] Missing hash [{}]: {}{cr}",
+				if side>0 {">"} else {"<"},
+				fields.1,
+			);
+
+			*ambiguousFileCount += 1;
+		}
+
+		Ok((rest, Some(LogLine
+		{
+			by: None,
+			hash,
+			path: unsafe_dup_str(fields.1),
+		})))
+	}
 }
+
+impl RKD
+{
+	fn new() -> Self
+	{
+		RKD
+		{
+			hashes: MapObjectFromHash::new(),
+			trees: Vec::new(),
+		}
+	}
+
+	fn diff(&mut self,logL: &Vec<&str>,logR: &Vec<&str>) -> i32
+	{
+		assert_eq!(self.trees.len(),0);
+
+		let mut ambiguousFileCountL=0;
+		let mut ambiguousFileCountR=0;
+		self.parse_side(&logL,&args.exclude,&mut ambiguousFileCountL);
+		self.parse_side(&logR,&args.exclude,&mut ambiguousFileCountR);
+
+		assert_eq!(self.trees.len(),2);
+
+		self.diff_cpmv();
+		self.diff_remaining();
+
+		if ambiguousFileCountL>0 || ambiguousFileCountR>0
+		{
+			use inline_colorization::*;
+			const cby: &str = color_bright_yellow;
+			const cr: &str = color_reset;
+
+			eprintln!("{cby}[WARNING] Ambiguous files: < {}, > {}{cr}",ambiguousFileCountL,ambiguousFileCountR);
+		}
+
+		0
+	}
+
+	fn diff_remaining(&self)
+	{
+		let _timer = ScopeTimer::new(args.timings,"diff_remaining");
+
+		debug_assert_eq!(self.trees.len(),2);
+
+		for (path,nodeL) in &self.trees[0]
+		{
+			if nodeL.is_done() {continue}
+
+			let nodeR_ = self.trees[1].get(path);
+
+			if nodeR_.is_none()
+			{
+				nodeL.report(DISABLE_OUTPUT,&FSOp::Delete);
+				continue;
+			}
+
+			if let (Some(hL),Some(hR)) = (nodeL.hash,nodeR_.unwrap().hash)
+			{
+				debug_assert_ne!(hL,hR); // hash-based matching should already have disposed of this match
+			}
+
+			nodeL.report(DISABLE_OUTPUT,&FSOp::Modify{lhs: nodeR_.unwrap()});
+		}
+
+		for nodeR in self.trees[1].values()
+		{
+			nodeR.report(DISABLE_OUTPUT,&FSOp::Create);
+		}
+	}
+
+	fn match_right<'a>(itL: &'a mut VecIterator<&FSTreeFile>,nodeR: &FSTreeFile) -> &'a FSTreeFile
+	{
+		while let Some(nodeL) = itL.curr()
+		{
+			if nodeL.path.bytes().rev().ge(nodeR.path.bytes().rev()) {break}
+			itL.advance();
+		}
+
+		let (prev,curr) = (itL.prev(),itL.curr());
+
+		if let (Some(pu),Some(cu)) = (prev,curr)
+		{
+			return match best_prefix_match(nodeR.path.bytes().rev(),pu.path.bytes().rev(),cu.path.bytes().rev())
+			{
+				BestPrefixMatch::First => pu,
+				_ => cu,
+			};
+		}
+
+		prev.unwrap_or_else(|| curr.unwrap())
+	}
+
+	fn diff_cpmv(&self)
+	{
+		let _timer = ScopeTimer::new(args.timings,"diff_cpmv");
+
+		debug_assert_eq!(self.trees.len(),2);
+
+		for (hash,obj) in self.hashes.iter()
+		{
+			if hash == &EMPTY_HASH {continue}
+
+			// Build a reference list for RHS, excluding done items (i.e. make a "to report on" list)
+			let mut pathsR = obj.treeInstances[1].paths.iter()
+				.filter_map(|nodeR| if !nodeR.is_done() {Some(*nodeR)} else {None})
+				.collect::<Vec<_>>();
+
+			if pathsR.is_empty() {continue}
+
+			// Build a reference list for LHS, including done items (i.e. make a "possible cp/mv sources" list)
+			let mut pathsL = obj.treeInstances[0].paths.iter().map(|nodeL| *nodeL).collect::<Vec<_>>();
+
+			if pathsL.is_empty() {continue}
+
+			// Sort both lists by path suffix for good cp/mv matching
+			sort_revpath(&mut pathsR);
+			sort_revpath(&mut pathsL);
+
+			let mut itL = VecIterator::new(&pathsL); // Iterator for following the RHS item on the left (like merge sort)
+
+			for nodeR in pathsR
+			{
+				let nodeL = Self::match_right(&mut itL,nodeR);
+				nodeR.report(DISABLE_OUTPUT,&FSOp::CopyMove{src: nodeL});
+			}
+		}
+	}
+
+	fn make_node(&mut self,side: usize,path: &'static str,hash: Option<Hash>,allow_match: bool) -> FSTreeFile
+	{
+		debug_assert!(side<2);
+
+		// We can only match the LHS if we're processing the RHS; also don't match if e.g. there's a size mismatch
+		if allow_match && side>0
+		{
+			if let Some(h) = hash // Pseudohashes are not matchable
+			{
+				return FSTreeFile::clone_or_new(path,h,&mut self.trees[0]);
+			}
+		}
+
+		FSTreeFile::new(path,hash)
+	}
+
+	fn insert_hash_entry<'a>(hashes: &'a mut MapObjectFromHash,hash: &Hash,by: Option<i64>) -> &'a mut Object
+	{
+		if !hashes.contains_key(&hash)
+		{
+			hashes.insert(
+				hash.clone(),
+				Object::new(by));
+		}
+
+		let result = hashes.get_mut(hash).unwrap(); // TODO elide lookup when inserting
+
+		if let(Some(byNew),Some(byOld)) = (by,result.by.get())
+		{
+			debug_assert_eq!(byNew,byOld); // This should never happen since we check for size mismatches earlier
+		}
+
+		result
+	}
+
+	fn blacklist_size_mismatch(&self, parsed: &LogLine, ambiguousFileCount: &mut usize) -> bool
+	{
+		// If there's a real hash and it exists in our map, check if the size also matches
+		if let Some(hash) = parsed.hash
+		{
+			if let Some(obj) = self.hashes.get(&hash)
+			{
+				if let (Some(byParsed),Some(byObj)) = (parsed.by,obj.by.get())
+				{
+					if byObj!=byParsed
+					{
+						use inline_colorization::*;
+						const cby: &str = color_bright_yellow;
+						const cr: &str = color_reset;
+
+						eprintln!(
+							"{cby}[WARNING] File-size mismatch [{}]: {}{cr}",
+							if self.trees.len() > 0 {">"} else {"<"},
+							parsed.path,
+						);
+
+						*ambiguousFileCount += 1;
+
+						// Size mismatch - blacklist this hash
+						obj.by.set(Some(-1));
+						return true;
+					}
+				}
+			}
+		}
+
+		false // Either there's no hash, it hasn't been seen before, or the sizes match
+	}
+
+	fn parse_side(&mut self,log: &Vec<&str>,excludes: &[String],ambiguousFileCount: &mut usize)
+	{
+		assert!(self.trees.len() < 2);
+
+		let _timer = ScopeTimer::new(args.timings,"parse_log");
+
+		let side = self.trees.len();
+
+		debug_assert!(side<2);
+
+		let mut files = MapFileFromPath::new();
+
+		'line_parser: for line in log 
+		{
+			let parsed = match (LogLine::parse1(&line,ambiguousFileCount,side),LogLine::parse2(&line,ambiguousFileCount,side))
+			{
+				(Err(_),Err(_)) =>
+				{
+					use inline_colorization::*;
+					const cbr: &str = color_bright_red;
+					const cr: &str = color_reset;
+			
+					// Impossible to parse
+					eprintln!(
+						"{cbr}[ERROR] Unparseable line [{}]: {}{cr}",
+						if side>0 {">"} else {"<"},
+						&line,
+					);
+
+					std::process::exit(4);
+				},
+				(Ok((_,None)),Ok((_,None))) => None,
+				(Ok(_), Ok(_)) =>
+				{
+					use inline_colorization::*;
+					const cbr: &str = color_bright_red;
+					const cr: &str = color_reset;
+
+					// Parseable with both line formats
+					eprintln!(
+						"{cbr}[ERROR] Format-ambiguous line [{}]: {}{cr}",
+						if side>0 {">"} else {"<"},
+						&line,
+					);
+
+					std::process::exit(5);
+				},
+				(Err(_),Ok(r)) | (Ok(r),Err(_)) => {r.1}, // Good: only one matched
+			};
+
+			if parsed.is_none() {continue;}
+
+			let parsed = parsed.unwrap();
+
+			for substr in excludes
+			{
+				if parsed.path.contains(substr)
+				{
+					continue 'line_parser;
+				}
+			}
+
+			// If the incoming hash is real, and it's already registered in the hash-keyed collection, we have an 
+			// opportunity to make sure that all instances of this hash seen so far match in file size; if not, we need 
+			// to globally blacklist that hash for copy/move matching so that we don't lie about files being unchanged
+			let should_prematch = !self.blacklist_size_mismatch(&parsed,ambiguousFileCount);
+
+			let node = Box::leak(
+				Box::new(
+					self.make_node(
+						side,
+						&parsed.path,
+						parsed.hash,
+						should_prematch,
+					))); // TODO improve
+
+			// An item with a pseudohash can't be entered into our hash-keyed map, which disables move/rename matching
+			if let Some(hash) = parsed.hash
+			{
+				let entry = Self::insert_hash_entry(&mut self.hashes,&hash,parsed.by);
+				entry.treeInstances[side].paths.push(node);
+			}
+
+			files.insert(parsed.path,node);
+		}
+
+		self.trees.push(files);
+	}
+}
+
+////////////////////////////////////////////////////////////////////////////////
 
 fn parse_path(path: &str) -> PathLocation
 {
@@ -269,14 +878,6 @@ fn format_path_display(path_loc: &PathLocation) -> String {
 	}
 }
 
-#[macro_use]
-extern crate lazy_static;
-
-lazy_static!
-{
-	static ref args: Args = <Args as clap::Parser>::parse();
-}
-
 fn slurp_log(stream: Box<dyn std::io::Read>) -> Vec<&'static str>
 {
 	let _timer = ScopeTimer::new(args.timings,"slurp_log");
@@ -335,466 +936,6 @@ fn main()
 	// exit() is here to prevent destructors from being run, which adds a second or two to runtime
 	std::process::exit(
 		rkd.diff(&logL,&logR));
-}
-
-enum FSOp<'a>
-{
-	Delete,
-	Create,
-	CopyMove {src: &'a FSNode},
-	Modify   {lhs: &'a FSNode},
-}
-
-impl FSNode
-{
-	fn new(path: &'static str,hash: Option<Hash>) -> Self
-	{
-		FSNode
-		{
-			path,
-			hash,
-			done: std::cell::Cell::new(false),
-		}
-	}
-
-	fn try_recycle(path: &'static str,hash: Hash,otherSide: &mut MapPaths) -> Option<Self>
-	{
-		if let Some(o) = otherSide.get(path)
-		{
-			if o.hash == Some(hash)
-			{
-				// Hashable and identical to an item on the other side: recycle and set done
-				o.set_done();
-				return Some((*o).clone());
-			}
-		}
-
-		None
-	}
-
-	fn clone_or_new(path: &'static str,hash: Hash,otherSide: &mut MapPaths) -> Self
-	{
-		if let Some(rr) = Self::try_recycle(path,hash,otherSide) {return rr;}
-
-		Self::new(path,Some(hash))
-	}
-
-	fn is_done(&self) -> bool
-	{
-		self.done.get()
-	}
-
-	fn set_done(&self)
-	{
-		debug_assert!(!self.is_done());
-		self.done.set(true);
-	}
-
-	fn report(&self,disable: bool,op: &FSOp)
-	{
-		if self.is_done() {return};
-
-		let mut lock = std::io::stdout().lock();
-
-		use std::borrow::Cow;
-		use shell_escape::escape;
-		use colored::*;
-		use io::Write;
-		use inline_colorization::*;
-
-		const cbw: &str = color_bright_white;
-		const cr: &str = color_reset;
-
-		match op
-		{
-			FSOp::Delete | FSOp::Create  =>
-			{
-				if !disable
-				{
-					let verb  =  if let FSOp::Delete = op {"RM".red()} else {"CR".green()};
-
-					let path = escape(Cow::Borrowed(self.path));
-
-					writeln!(
-						lock,
-						"{verb} {}",
-						if self.hash.is_none() {path.bright_blue()} else {path.white()},
-					).unwrap();
-				}
-			},
-			FSOp::CopyMove{src} =>
-			{
-				assert_ne!(src.path,self.path);
-
-				// If paths match, neither must be done and it's a MV
-				let copy = if src.is_done() {true} else {src.set_done(); false};
-
-				let verb  =  if copy {"CP".cyan()} else {"MV".magenta()};
-
-				if !disable
-				{
-					if args.no_prefix
-					{
-						writeln!(
-							lock,
-							"{verb} {} {}",
-							src.path,
-							self.path
-						).unwrap();
-					}
-					else
-					{
-						let len=prefix_match_len(src.path.chars(),self.path.chars()); // Find common path prefix
-
-						// Get rid of any common terminal-name prefix match to get a valid ancestor path
-						let pos = match self.path[0..len].rfind('/')
-						{
-							Some(x) => 1+x,
-							None => 0,
-						};
-
-						let prefix = &self.path[0..pos];
-
-						// Print common ancestor and then each path relative to that
-						writeln!(
-							lock,
-							"{verb} {cbw}{}{cr}{}{} {}",
-							prefix,
-							if prefix.is_empty() {""} else {" "},
-							&escape(Cow::Borrowed(src.path))[pos..],
-							&escape(Cow::Borrowed(self.path))[pos..]).unwrap();
-					}
-				}
-			},
-			FSOp::Modify{lhs} =>
-			{
-				if !disable
-				{
-					use inline_colorization::*;
-					const cr: &str = color_reset;
-					const cmd: &str = color_yellow;
-
-					writeln!(
-						lock,
-						"{cmd}MD{cr} {}",
-						escape(Cow::Borrowed(self.path))).unwrap();
-				}
-
-				lhs.set_done();
-			},
-		};
-
-		self.set_done();
-	}
-}
-
-impl Side
-{
-	fn new() -> Self
-	{
-		Self{paths: Vec::new()}
-	}
-}
-
-impl Object
-{
-	fn new(by: Option<i64>) -> Self
-	{
-		Self{by: std::cell::Cell::new(by),sides: [Side::new(),Side::new()]}
-	}
-}
-
-impl RKD
-{
-	fn new() -> Self
-	{
-		RKD
-		{
-			hashes: MapHashes::new(),
-			sides: Vec::new(),
-		}
-	}
-
-	fn diff(&mut self,logL: &Vec<&str>,logR: &Vec<&str>) -> i32
-	{
-		assert_eq!(self.sides.len(),0);
-
-		let mut ambiguousFileCountL=0;
-		let mut ambiguousFileCountR=0;
-		self.parse_side(&logL,&args.exclude,&mut ambiguousFileCountL);
-		self.parse_side(&logR,&args.exclude,&mut ambiguousFileCountR);
-
-		assert_eq!(self.sides.len(),2);
-
-		self.diff_cpmv();
-		self.diff_remaining();
-
-		if ambiguousFileCountL>0 || ambiguousFileCountR>0
-		{
-			use inline_colorization::*;
-			const cby: &str = color_bright_yellow;
-			const cr: &str = color_reset;
-
-			eprintln!("{cby}[WARNING] Ambiguous files: < {}, > {}{cr}",ambiguousFileCountL,ambiguousFileCountR);
-		}
-
-		0
-	}
-
-	fn diff_remaining(&self)
-	{
-		let _timer = ScopeTimer::new(args.timings,"diff_remaining");
-
-		debug_assert_eq!(self.sides.len(),2);
-
-		for (path,nodeL) in &self.sides[0]
-		{
-			if nodeL.is_done() {continue}
-
-			let nodeR_ = self.sides[1].get(path);
-
-			if nodeR_.is_none()
-			{
-				nodeL.report(DISABLE_OUTPUT,&FSOp::Delete);
-				continue;
-			}
-
-			if let (Some(hL),Some(hR)) = (nodeL.hash,nodeR_.unwrap().hash)
-			{
-				debug_assert_ne!(hL,hR); // hash-based matching should already have disposed of this match
-			}
-
-			nodeL.report(DISABLE_OUTPUT,&FSOp::Modify{lhs: nodeR_.unwrap()});
-		}
-
-		for nodeR in self.sides[1].values()
-		{
-			nodeR.report(DISABLE_OUTPUT,&FSOp::Create);
-		}
-	}
-
-	fn match_right<'a>(itL: &'a mut VecIterator<&FSNode>,nodeR: &FSNode) -> &'a FSNode
-	{
-		while let Some(nodeL) = itL.curr()
-		{
-			if nodeL.path.bytes().rev().ge(nodeR.path.bytes().rev()) {break}
-			itL.advance();
-		}
-
-		let (prev,curr) = (itL.prev(),itL.curr());
-
-		if let (Some(pu),Some(cu)) = (prev,curr)
-		{
-			return match best_prefix_match(nodeR.path.bytes().rev(),pu.path.bytes().rev(),cu.path.bytes().rev())
-			{
-				BestPrefixMatch::First => pu,
-				_ => cu,
-			};
-		}
-
-		prev.unwrap_or_else(|| curr.unwrap())
-	}
-
-	fn diff_cpmv(&self)
-	{
-		let _timer = ScopeTimer::new(args.timings,"diff_cpmv");
-
-		debug_assert_eq!(self.sides.len(),2);
-
-		for (hash,obj) in self.hashes.iter()
-		{
-			if hash == &EMPTY_HASH {continue}
-
-			// Build a reference list for RHS, excluding done items (i.e. make a "to report on" list)
-			let mut pathsR = obj.sides[1].paths.iter()
-				.filter_map(|nodeR| if !nodeR.is_done() {Some(*nodeR)} else {None})
-				.collect::<Vec<_>>();
-
-			if pathsR.is_empty() {continue}
-
-			// Build a reference list for LHS, including done items (i.e. make a "possible cp/mv sources" list)
-			let mut pathsL = obj.sides[0].paths.iter().map(|nodeL| *nodeL).collect::<Vec<_>>();
-
-			if pathsL.is_empty() {continue}
-
-			// Sort both lists by path suffix for good cp/mv matching
-			sort_revpath(&mut pathsR);
-			sort_revpath(&mut pathsL);
-
-			let mut itL = VecIterator::new(&pathsL); // Iterator for following the RHS item on the left (like merge sort)
-
-			for nodeR in pathsR
-			{
-				let nodeL = Self::match_right(&mut itL,nodeR);
-				nodeR.report(DISABLE_OUTPUT,&FSOp::CopyMove{src: nodeL});
-			}
-		}
-	}
-
-	fn make_node(&mut self,side: usize,path: &'static str,hash: Option<Hash>,allow_match: bool) -> FSNode
-	{
-		debug_assert!(side<2);
-
-		// We can only match the LHS if we're processing the RHS; also don't match if e.g. there's a size mismatch
-		if allow_match && side>0
-		{
-			if let Some(h) = hash // Pseudohashes are not matchable
-			{
-				return FSNode::clone_or_new(path,h,&mut self.sides[0]);
-			}
-		}
-
-		FSNode::new(path,hash)
-	}
-
-	fn insert_hash_entry<'a>(hashes: &'a mut MapHashes,hash: &Hash,by: Option<i64>) -> &'a mut Object
-	{
-		if !hashes.contains_key(&hash)
-		{
-			hashes.insert(
-				hash.clone(),
-				Object::new(by));
-		}
-
-		let result = hashes.get_mut(hash).unwrap(); // TODO elide lookup when inserting
-
-		if let(Some(byNew),Some(byOld)) = (by,result.by.get())
-		{
-			debug_assert_eq!(byNew,byOld); // This should never happen since we check for size mismatches earlier
-		}
-
-		result
-	}
-
-	fn blacklist_size_mismatch(&self, parsed: &LogLine, ambiguousFileCount: &mut usize) -> bool
-	{
-		// If there's a real hash and it exists in our map, check if the size also matches
-		if let Some(hash) = parsed.hash
-		{
-			if let Some(obj) = self.hashes.get(&hash)
-			{
-				if let (Some(byParsed),Some(byObj)) = (parsed.by,obj.by.get())
-				{
-					if byObj!=byParsed
-					{
-						use inline_colorization::*;
-						const cby: &str = color_bright_yellow;
-						const cr: &str = color_reset;
-
-						eprintln!(
-							"{cby}[WARNING] File-size mismatch [{}]: {}{cr}",
-							if self.sides.len() > 0 {">"} else {"<"},
-							parsed.path,
-						);
-
-						*ambiguousFileCount += 1;
-
-						// Size mismatch - blacklist this hash
-						obj.by.set(Some(-1));
-						return true;
-					}
-				}
-			}
-		}
-
-		false // Either there's no hash, it hasn't been seen before, or the sizes match
-	}
-
-	fn parse_side(&mut self,log: &Vec<&str>,excludes: &[String],ambiguousFileCount: &mut usize)
-	{
-		assert!(self.sides.len() < 2);
-
-		let _timer = ScopeTimer::new(args.timings,"parse_log");
-
-		let side = self.sides.len();
-
-		debug_assert!(side<2);
-
-		let mut files = MapPaths::new();
-
-		'line_parser: for line in log 
-		{
-			let parsed = match (LogLine::parse1(&line,ambiguousFileCount,side),LogLine::parse2(&line,ambiguousFileCount,side))
-			{
-				(Err(_),Err(_)) =>
-				{
-					use inline_colorization::*;
-					const cbr: &str = color_bright_red;
-					const cr: &str = color_reset;
-			
-					// Impossible to parse
-					eprintln!(
-						"{cbr}[ERROR] Unparseable line [{}]: {}{cr}",
-						if side>0 {">"} else {"<"},
-						&line,
-					);
-
-					std::process::exit(4);
-				},
-				(Ok((_,None)),Ok((_,None))) => None,
-				(Ok(_), Ok(_)) =>
-				{
-					use inline_colorization::*;
-					const cbr: &str = color_bright_red;
-					const cr: &str = color_reset;
-
-					// Parseable with both line formats
-					eprintln!(
-						"{cbr}[ERROR] Format-ambiguous line [{}]: {}{cr}",
-						if side>0 {">"} else {"<"},
-						&line,
-					);
-
-					std::process::exit(5);
-				},
-				(Err(_),Ok(r)) | (Ok(r),Err(_)) => {r.1}, // Good: only one matched
-			};
-
-			if parsed.is_none() {continue;}
-
-			let parsed = parsed.unwrap();
-
-			for substr in excludes
-			{
-				if parsed.path.contains(substr)
-				{
-					continue 'line_parser;
-				}
-			}
-
-			// If the incoming hash is real, and it's already registered in the hash-keyed collection, we have an 
-			// opportunity to make sure that all instances of this hash seen so far match in file size; if not, we need 
-			// to globally blacklist that hash for copy/move matching so that we don't lie about files being unchanged
-			let should_prematch = !self.blacklist_size_mismatch(&parsed,ambiguousFileCount);
-
-			let node = Box::leak(
-				Box::new(
-					self.make_node(
-						side,
-						&parsed.path,
-						parsed.hash,
-						should_prematch,
-					))); // TODO improve
-
-			// An item with a pseudohash can't be entered into our hash-keyed map, which disables move/rename matching
-			if let Some(hash) = parsed.hash
-			{
-				let entry = Self::insert_hash_entry(&mut self.hashes,&hash,parsed.by);
-				entry.sides[side].paths.push(node);
-			}
-
-			files.insert(parsed.path,node);
-		}
-
-		self.sides.push(files);
-	}
-}
-
-struct LogLine
-{
-	by: Option<i64>, // TODO negative sentinel?
-	hash: Option<Hash>,
-	path: &'static str,
 }
 
 fn hexhash_good(input: &str) -> nom::IResult<&str,&str>
@@ -874,130 +1015,6 @@ fn hexhash(input: &str) -> nom::IResult<&str,Option<Hash>>
 	}
 }
 
-impl LogLine
-{
-	fn parse1<'a>(input: &'a str,ambiguousFileCount: &mut usize,side: usize) -> nom::IResult<&'a str,Option<Self>>
-	{
-		use nom::{
-			sequence::*,
-			character::complete::*,
-			bytes::complete::tag,
-			combinator::{opt,all_consuming},
-			branch::alt,
-		};
-
-		// Skip lines that start with a hash (#) character or are empty
-		if input.is_empty() || input.starts_with('#')
-		{
-			return Ok((input,None));
-		}
-
-		let (rest,fields) = all_consuming(
-			tuple(
-				(
-					preceded(space0,terminated(i64,tag("  "))),
-					separated_pair(
-						hexhash,
-						tuple(
-							(
-								char(' '),
-								alt(
-									(
-										char(' '),
-										char('*')
-									),
-								),
-							),
-						),
-						preceded(opt(tag("./")),not_line_ending)),
-				)
-			)
-		)(input)?;
-
-		let hash = fields.1.0;
-
-		if hash.is_none()
-		{
-			use inline_colorization::*;
-			const cby: &str = color_bright_yellow;
-			const cr: &str = color_reset;
-	
-			eprintln!(
-				"{cby}[WARNING] Missing hash [{}]: {}{cr}",
-				if side>0 {">"} else {"<"},
-				fields.1.1,
-			);
-
-			*ambiguousFileCount += 1;
-		}
-
-		Ok((rest, Some(LogLine
-		{
-			by: Some(fields.0),
-			hash,
-			path: unsafe_dup_str(fields.1.1),
-		})))
-	}
-
-	fn parse2<'a>(input: &'a str,ambiguousFileCount: &mut usize,side: usize) -> nom::IResult<&'a str,Option<Self>>
-	{
-		use nom::{
-			sequence::*,
-			character::complete::*,
-			bytes::complete::tag,
-			combinator::{opt,all_consuming},
-			branch::alt,
-		};
-
-		// Skip lines that start with a hash (#) character or are empty
-		if input.is_empty() || input.starts_with('#')
-		{
-			return Ok((input,None));
-		}
-
-		let (rest,fields) = all_consuming(
-			separated_pair(
-				hexhash,
-				tuple(
-					(
-						char(' '),
-						alt(
-							(
-								char(' '),
-								char('*')
-							),
-						),
-					),
-				),
-				preceded(opt(tag("./")),not_line_ending)),
-		)(input)?;
-
-		let hash = fields.0;
-
-		if hash.is_none()
-		{
-			use inline_colorization::*;
-			const cby: &str = color_bright_yellow;
-			const cr: &str = color_reset;
-	
-			eprintln!(
-				"{cby}[WARNING] Missing hash [{}]: {}{cr}",
-				if side>0 {">"} else {"<"},
-				fields.1,
-			);
-
-			*ambiguousFileCount += 1;
-		}
-
-		Ok((rest, Some(LogLine
-		{
-			by: None,
-			hash,
-			path: unsafe_dup_str(fields.1),
-		})))
-	}
-}
-
 fn unsafe_dup_slice<T>(s: &[T]) -> &'static [T]
 {
 	unsafe
@@ -1013,18 +1030,10 @@ fn unsafe_dup_str(s: &str) -> &'static str
 
 ////////////////////////////////////////////////////////////////////////////////
 
-fn sort_revpath(v: &mut [&FSNode])
+fn sort_revpath(v: &mut [&FSTreeFile])
 {
 	v.sort_by(|l,r|
 		l.path.as_bytes().iter().rev().cmp(r.path.as_bytes().iter().rev()));
-}
-
-enum BestPrefixMatch
-{
-	First,
-	Second,
-	Neither, // Tie
-	// TODO distinguish tie from "no match" and implement a suffix-match threshold for the latter
 }
 
 fn best_prefix_match<I: Iterator<Item=u8>>(r: I,mut l1: I,mut l2: I) -> BestPrefixMatch
