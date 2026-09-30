@@ -5,6 +5,8 @@
 
 use std::io::{self,BufRead};
 use ahash::AHashMap;
+use std::collections::BTreeMap;
+use std::cell::RefCell;
 #[path="scopetimer.rs"]
 mod scopetimer;
 use scopetimer::ScopeTimer;
@@ -12,6 +14,11 @@ use scopetimer::ScopeTimer;
 const EMPTY_HASH: Hash = Hash(0xd41d8cd98f00b204e9800998ecf8427e);
 
 static DISABLE_OUTPUT: bool = false;
+
+thread_local!
+{
+	static STASHED_OPS: RefCell<BTreeMap<&'static str, FSOp>> = RefCell::new(BTreeMap::new());
+}
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -82,12 +89,13 @@ struct RKD
 	hashes: MapObjectFromHash,
 }
 
-enum FSOp<'a>
+#[derive(Clone)]
+enum FSOp
 {
-	Delete,
-	Create,
-	CopyMove {lhs: &'a FSTreeFile, isCopy: bool},
-	Modify   {lhs: &'a FSTreeFile},
+	Delete   {hasHash: bool},
+	Create   {hasHash: bool},
+	CopyMove {lhs: &'static str, isCopy: bool},
+	Modify   {lhs: &'static FSTreeFile},
 }
 
 struct LogLine
@@ -199,92 +207,16 @@ impl FSTreeFile
 	{
 		if self.is_done() {return};
 
-		let mut lock = std::io::stdout().lock();
-
-		use std::borrow::Cow;
-		use shell_escape::escape;
-		use colored::*;
-		use io::Write;
-		use inline_colorization::*;
-
-		const cbw: &str = color_bright_white;
-		const cr: &str = color_reset;
-
-		match op
+		if let FSOp::Modify{lhs} = op
 		{
-			FSOp::Delete | FSOp::Create  =>
-			{
-				if !disable
-				{
-					let verb  =  if let FSOp::Delete = op {"RM".red()} else {"CR".green()};
+			lhs.set_done();
+		}
 
-					let path = escape(Cow::Borrowed(self.path));
+		if disable {return};
 
-					writeln!(
-						lock,
-						"{verb} {}",
-						if self.hash.is_none() {path.bright_blue()} else {path.white()},
-					).unwrap();
-				}
-			},
-			FSOp::CopyMove{lhs, isCopy} =>
-			{
-				assert_ne!(lhs.path,self.path);
-
-				let verb  =  if *isCopy {"CP".cyan()} else {"MV".magenta()};
-
-				if !disable
-				{
-					if args.no_prefix
-					{
-						writeln!(
-							lock,
-							"{verb} {} {}",
-							lhs.path,
-							self.path
-						).unwrap();
-					}
-					else
-					{
-						let len=prefix_match_len(lhs.path.chars(),self.path.chars()); // Find common path prefix
-
-						// Get rid of any common terminal-name prefix match to get a valid ancestor path
-						let pos = match self.path[0..len].rfind('/')
-						{
-							Some(x) => 1+x,
-							None => 0,
-						};
-
-						let prefix = &self.path[0..pos];
-
-						// Print common ancestor and then each path relative to that
-						writeln!(
-							lock,
-							"{verb} {cbw}{}{cr}{}{} {}",
-							prefix,
-							if prefix.is_empty() {""} else {" "},
-							&escape(Cow::Borrowed(lhs.path))[pos..],
-							&escape(Cow::Borrowed(self.path))[pos..]).unwrap();
-					}
-				}
-			},
-			FSOp::Modify{lhs} =>
-			{
-				if !disable
-				{
-					use inline_colorization::*;
-					const cr: &str = color_reset;
-					const cmd: &str = color_yellow;
-
-					writeln!(
-						lock,
-						"{cmd}MD{cr} {}",
-						escape(Cow::Borrowed(self.path))).unwrap();
-				}
-
-				lhs.set_done();
-			},
-		};
+		STASHED_OPS.with(|stash| {
+			stash.borrow_mut().insert(self.path, op.clone());
+		});
 
 		self.set_done();
 	}
@@ -465,7 +397,7 @@ impl RKD
 
 			if nodeR_.is_none()
 			{
-				nodeL.report(DISABLE_OUTPUT,&FSOp::Delete);
+				nodeL.report(DISABLE_OUTPUT,&FSOp::Delete{hasHash: nodeL.hash.is_some()});
 				continue;
 			}
 
@@ -479,7 +411,7 @@ impl RKD
 
 		for nodeR in self.trees[1].values()
 		{
-			nodeR.report(DISABLE_OUTPUT,&FSOp::Create);
+			nodeR.report(DISABLE_OUTPUT,&FSOp::Create{hasHash: nodeR.hash.is_some()});
 		}
 	}
 
@@ -537,7 +469,7 @@ impl RKD
 			{
 				let nodeL = Self::match_right(&mut itL,nodeR);
 				let isCopy = if nodeL.is_done() {true} else {nodeL.set_done(); false};
-				nodeR.report(DISABLE_OUTPUT,&FSOp::CopyMove{lhs: nodeL, isCopy});
+				nodeR.report(DISABLE_OUTPUT,&FSOp::CopyMove{lhs: nodeL.path, isCopy});
 			}
 		}
 	}
@@ -890,6 +822,96 @@ fn slurp_log(stream: Box<dyn std::io::Read>) -> Vec<&'static str>
 	log
 }
 
+fn print_stashed_ops()
+{
+	let mut lock = std::io::stdout().lock();
+
+	use std::borrow::Cow;
+	use shell_escape::escape;
+	use colored::*;
+	use io::Write;
+	use inline_colorization::*;
+
+	const cbw: &str = color_bright_white;
+	const cr: &str = color_reset;
+
+	STASHED_OPS.with(|stash| {
+		for (path, op) in stash.borrow().iter()
+		{
+			match op.clone()
+			{
+				FSOp::Delete{hasHash} =>
+				{
+					let verb = "RM".red();
+
+					let path_escaped = escape(Cow::Borrowed(path));
+
+					writeln!(
+						lock,
+						"{verb} {}",
+						if !hasHash {path_escaped.bright_blue()} else {path_escaped.white()},
+					).unwrap();
+				},
+				FSOp::Create{hasHash} =>
+				{
+					let verb = "CR".green();
+
+					let path_escaped = escape(Cow::Borrowed(path));
+
+					writeln!(
+						lock,
+						"{verb} {}",
+						if !hasHash {path_escaped.bright_blue()} else {path_escaped.white()},
+					).unwrap();
+				},
+				FSOp::CopyMove{lhs, isCopy} =>
+				{
+					let verb  =  if isCopy {"CP".cyan()} else {"MV".magenta()};
+
+					if args.no_prefix
+					{
+						writeln!(
+							lock,
+							"{verb} {} {}",
+							lhs,
+							path
+						).unwrap();
+					}
+					else
+					{
+						let len = prefix_match_len(lhs.chars(), path.chars());
+
+						let pos = match path[0..len].rfind('/')
+						{
+							Some(x) => 1+x,
+							None => 0,
+						};
+
+						let prefix = &path[0..pos];
+
+						writeln!(
+							lock,
+							"{verb} {cbw}{}{cr}{}{} {}",
+							prefix,
+							if prefix.is_empty() {""} else {" "},
+							&escape(Cow::Borrowed(lhs))[pos..],
+							&escape(Cow::Borrowed(path))[pos..]).unwrap();
+					}
+				},
+				FSOp::Modify{lhs: _} =>
+				{
+					const cmd: &str = color_yellow;
+
+					writeln!(
+						lock,
+						"{cmd}MD{cr} {}",
+						escape(Cow::Borrowed(path))).unwrap();
+				},
+			}
+		}
+	});
+}
+
 fn main()
 {
 	let pathL = parse_path(&args.treeL);
@@ -931,9 +953,12 @@ fn main()
 
 	let mut rkd = RKD::new();
 
+	let exit_code = rkd.diff(&logL,&logR);
+
+	print_stashed_ops();
+
 	// exit() is here to prevent destructors from being run, which adds a second or two to runtime
-	std::process::exit(
-		rkd.diff(&logL,&logR));
+	std::process::exit(exit_code);
 }
 
 fn hexhash_good(input: &str) -> nom::IResult<&str,&str>
