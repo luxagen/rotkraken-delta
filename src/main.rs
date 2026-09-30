@@ -86,7 +86,7 @@ enum FSOp<'a>
 {
 	Delete,
 	Create,
-	CopyMove {lhs: &'a FSTreeFile},
+	CopyMove {lhs: &'a FSTreeFile, isCopy: bool},
 	Modify   {lhs: &'a FSTreeFile},
 }
 
@@ -227,14 +227,11 @@ impl FSTreeFile
 					).unwrap();
 				}
 			},
-			FSOp::CopyMove{lhs} =>
+			FSOp::CopyMove{lhs, isCopy} =>
 			{
 				assert_ne!(lhs.path,self.path);
 
-				// If paths match, neither must be done and it's a MV
-				let copy = if lhs.is_done() {true} else {lhs.set_done(); false};
-
-				let verb  =  if copy {"CP".cyan()} else {"MV".magenta()};
+				let verb  =  if *isCopy {"CP".cyan()} else {"MV".magenta()};
 
 				if !disable
 				{
@@ -539,7 +536,8 @@ impl RKD
 			for nodeR in pathsR
 			{
 				let nodeL = Self::match_right(&mut itL,nodeR);
-				nodeR.report(DISABLE_OUTPUT,&FSOp::CopyMove{lhs: nodeL});
+				let isCopy = if nodeL.is_done() {true} else {nodeL.set_done(); false};
+				nodeR.report(DISABLE_OUTPUT,&FSOp::CopyMove{lhs: nodeL, isCopy});
 			}
 		}
 	}
