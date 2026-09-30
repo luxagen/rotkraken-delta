@@ -343,17 +343,17 @@ fn main()
 			use inline_colorization::*;
 			const cbr: &str = color_bright_red;
 			const cr: &str = color_reset;
-			
+
 			let missing = (right.is_err() as i32) << 1 | (left.is_err() as i32);
-			
+
 			if left.is_err() {
 				eprintln!("{cbr}[ERROR]: Left tree '{}' not found{cr}", format_path_display(&pathL));
 			}
-			
+
 			if right.is_err() {
 				eprintln!("{cbr}[ERROR]: Right tree '{}' not found{cr}", format_path_display(&pathR));
 			}
-			
+
 			std::process::exit(missing);
 		}
 	};
