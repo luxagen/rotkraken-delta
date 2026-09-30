@@ -86,7 +86,7 @@ enum FSOp<'a>
 {
 	Delete,
 	Create,
-	CopyMove {src: &'a FSTreeFile},
+	CopyMove {lhs: &'a FSTreeFile},
 	Modify   {lhs: &'a FSTreeFile},
 }
 
@@ -227,12 +227,12 @@ impl FSTreeFile
 					).unwrap();
 				}
 			},
-			FSOp::CopyMove{src} =>
+			FSOp::CopyMove{lhs} =>
 			{
-				assert_ne!(src.path,self.path);
+				assert_ne!(lhs.path,self.path);
 
 				// If paths match, neither must be done and it's a MV
-				let copy = if src.is_done() {true} else {src.set_done(); false};
+				let copy = if lhs.is_done() {true} else {lhs.set_done(); false};
 
 				let verb  =  if copy {"CP".cyan()} else {"MV".magenta()};
 
@@ -243,13 +243,13 @@ impl FSTreeFile
 						writeln!(
 							lock,
 							"{verb} {} {}",
-							src.path,
+							lhs.path,
 							self.path
 						).unwrap();
 					}
 					else
 					{
-						let len=prefix_match_len(src.path.chars(),self.path.chars()); // Find common path prefix
+						let len=prefix_match_len(lhs.path.chars(),self.path.chars()); // Find common path prefix
 
 						// Get rid of any common terminal-name prefix match to get a valid ancestor path
 						let pos = match self.path[0..len].rfind('/')
@@ -266,7 +266,7 @@ impl FSTreeFile
 							"{verb} {cbw}{}{cr}{}{} {}",
 							prefix,
 							if prefix.is_empty() {""} else {" "},
-							&escape(Cow::Borrowed(src.path))[pos..],
+							&escape(Cow::Borrowed(lhs.path))[pos..],
 							&escape(Cow::Borrowed(self.path))[pos..]).unwrap();
 					}
 				}
@@ -539,7 +539,7 @@ impl RKD
 			for nodeR in pathsR
 			{
 				let nodeL = Self::match_right(&mut itL,nodeR);
-				nodeR.report(DISABLE_OUTPUT,&FSOp::CopyMove{src: nodeL});
+				nodeR.report(DISABLE_OUTPUT,&FSOp::CopyMove{lhs: nodeL});
 			}
 		}
 	}
